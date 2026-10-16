@@ -1,0 +1,62 @@
+{
+  "keyboard_guard": {
+    "enabled": true,
+    "keyboards": [
+      "AT Translated Set 2 keyboard"
+    ],
+    "touchpads": [],
+    "switch_device": "Intel HID switches",
+    "switch_code": "SW_TABLET_MODE"
+  },
+  "pen_scroll": {
+    "enabled": true,
+    "stylus_name": "ELAN2514:00 04F3:442A Stylus",
+    "button1": "left_click",
+    "button2": "right_click",
+    "tip_scroll": true,
+    "mm_per_notch": 6.0,
+    "invert": false,
+    "start_mm": 1.5
+  },
+  "effects": {
+    "touch_points": true,
+    "show_click": false
+  },
+  "gestures": {
+    "enabled": true,
+    "touchscreen_name": "ELAN2514:00 04F3:442A",
+    "swipe_frac_x": 0.12,
+    "swipe_frac_y": 0.12,
+    "pinch_out_ratio": 1.22,
+    "pinch_in_ratio": 0.82,
+    "cooldown_s": 0.4,
+    "map": {
+      "3_swipe_left": "prev_desktop",
+      "3_swipe_right": "next_desktop",
+      "3_swipe_up": "overview",
+      "3_swipe_down": "show_desktop",
+      "3_pinch_out": "zoom_in",
+      "3_pinch_in": "zoom_out",
+      "4_swipe_left": "prev_desktop",
+      "4_swipe_right": "next_desktop",
+      "4_swipe_up": "overview",
+      "4_swipe_down": "show_desktop",
+      "4_pinch_out": "zoom_in",
+      "4_pinch_in": "zoom_out",
+      "5_swipe_left": "prev_desktop",
+      "5_swipe_right": "next_desktop",
+      "5_swipe_up": "overview",
+      "5_swipe_down": "show_desktop",
+      "5_pinch_out": "zoom_in",
+      "5_pinch_in": "zoom_out"
+    },
+    "step_frac": 0.1,
+    "max_steps": 20
+  },
+  "pen_visual": {
+    "enabled": false,
+    "style": "ripple",
+    "size": 96,
+    "color": "#3daee9"
+  }
+}

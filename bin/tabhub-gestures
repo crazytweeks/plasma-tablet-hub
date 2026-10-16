@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""tabhub-gestures: multi-finger touchscreen gestures for KDE Wayland.
+
+KWin's Wayland gestures are hardcoded and there is no supported way to add
+touchscreen gestures (touchegg is X11-only). This daemon reads the raw
+touchscreen evdev node *without* grabbing it — so normal touch keeps working —
+tracks multi-touch contacts, recognises N-finger swipes and pinch, and fires
+configurable actions through KDE D-Bus or ydotool.
+
+No root needed (the user is in the `input` group).
+
+Config: ~/.config/tablet-hub/config.json  (section "gestures")
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+
+import libevdev
+from libevdev import EV_ABS, EV_KEY, EV_SYN
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from tabhub_actions import run_action  # type: ignore
+except Exception:  # noqa: BLE001
+    def run_action(name: str) -> None:  # fallback
+        pass
+try:
+    from tabhub_bus import Broadcaster, default_paths  # type: ignore
+except Exception:  # noqa: BLE001
+    Broadcaster = None  # type: ignore
+    default_paths = None  # type: ignore
+
+CONFIG = os.path.expanduser("~/.config/tablet-hub/config.json")
+MIN_FINGERS = 3
+MAX_FINGERS = 5
+
+DEFAULTS = {
+    "enabled": False,
+    "touchscreen_name": "ELAN2514:00 04F3:442A",
+    "swipe_frac_x": 0.12,
+    "swipe_frac_y": 0.12,
+    "pinch_out_ratio": 1.22,
+    "pinch_in_ratio": 0.82,
+    "cooldown_s": 0.4,
+    # repeatable actions (volume/brightness/zoom) fire once per this fraction of
+    # the swipe distance, so a longer swipe does more; capped at max_steps.
+    "step_frac": 0.10,
+    "max_steps": 20,
+    # key = "<fingers>_<gesture>"; generic keys (no prefix) are a fallback
+    "map": {
+        "swipe_left": "prev_desktop",
+        "swipe_right": "next_desktop",
+        "swipe_up": "overview",
+        "swipe_down": "show_desktop",
+        "pinch_out": "zoom_in",
+        "pinch_in": "zoom_out",
+    },
+}
+
+_running = True
+
+
+def log(msg: str) -> None:
+    print(f"tabhub-gestures: {msg}", flush=True)
+
+
+def load_cfg() -> dict:
+    cfg = dict(DEFAULTS)
+    cfg["map"] = dict(DEFAULTS["map"])
+    try:
+        with open(CONFIG) as fh:
+            data = json.load(fh).get("gestures", {})
+        for k, v in data.items():
+            if k == "map" and isinstance(v, dict):
+                cfg["map"].update(v)
+            else:
+                cfg[k] = v
+    except FileNotFoundError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        log(f"config read failed ({exc}); using defaults")
+    return cfg
+
+
+# --------------------------------------------------------------------------- gesture engine
+class Gestures:
+    def __init__(self, cfg: dict, x_range: tuple[int, int], y_range: tuple[int, int], bus=None):
+        self.cfg = cfg
+        self.bus = bus
+        self._last_state = 0.0
+        self.xr = x_range[1] - x_range[0] or 1
+        self.yr = y_range[1] - y_range[0] or 1
+        self.slots: dict[int, dict] = {}
+        self.slot = 0
+        self.tracking = False
+        self.fingers = 3
+        self.start = (0.0, 0.0, 0.0)
+        self.last = (0.0, 0.0, 0.0)
+        self.cooldown_until = 0.0
+
+    # -- input ----------------------------------------------------------------
+    def feed(self, events) -> None:
+        for e in events:
+            if e.matches(EV_SYN.SYN_DROPPED):
+                self.slots.clear()
+                continue
+            if e.matches(EV_SYN.SYN_REPORT):
+                self._frame()
+                continue
+            if e.matches(EV_ABS):
+                s = self.slots.setdefault(self.slot, {})
+                if e.code == EV_ABS.ABS_MT_SLOT:
+                    self.slot = e.value
+                elif e.code == EV_ABS.ABS_MT_TRACKING_ID:
+                    s["id"] = e.value
+                elif e.code == EV_ABS.ABS_MT_POSITION_X:
+                    s["x"] = e.value
+                elif e.code == EV_ABS.ABS_MT_POSITION_Y:
+                    s["y"] = e.value
+
+    def _active(self) -> list[dict]:
+        return [
+            c for c in self.slots.values()
+            if c.get("id", -1) >= 0 and "x" in c and "y" in c
+        ]
+
+    @staticmethod
+    def _stats(cs: list[dict]) -> tuple[float, float, float]:
+        cx = sum(c["x"] for c in cs) / len(cs)
+        cy = sum(c["y"] for c in cs) / len(cs)
+        spread = sum(math.hypot(c["x"] - cx, c["y"] - cy) for c in cs) / len(cs)
+        return cx, cy, spread
+
+    def _publish_state(self, n: int, spread: float) -> None:
+        if self.bus is None:
+            return
+        now = time.monotonic()
+        if now - self._last_state < 0.05:
+            return
+        self._last_state = now
+        self.bus.send({"t": "fingers", "n": n, "spread": round(spread, 1)})
+
+    def _frame(self) -> None:
+        now = time.monotonic()
+        active = self._active()
+        n = len(active)
+
+        if n:
+            cx, cy, sp = self._stats(active)
+            self._publish_state(n, sp)
+        else:
+            self._publish_state(0, 0.0)
+
+        if n >= MIN_FINGERS:
+            cx, cy, spread = self._stats(active)
+            if not self.tracking and now >= self.cooldown_until:
+                self.tracking = True
+                self.fingers = min(n, MAX_FINGERS)
+                self.start = self.last = (cx, cy, spread)
+            elif self.tracking:
+                self.fingers = min(max(self.fingers, n), MAX_FINGERS)
+                self.last = (cx, cy, spread)
+        elif self.tracking:
+            self._finish()
+        if n == 0:
+            self.tracking = False
+
+    def _finish(self) -> None:
+        self.tracking = False
+        self.cooldown_until = time.monotonic() + float(self.cfg.get("cooldown_s", 0.4))
+        sx, sy, ss = self.start
+        lx, ly, ls = self.last
+        mx = abs(lx - sx) / self.xr
+        my = abs(ly - sy) / self.yr
+        name = None
+        if max(mx, my) >= max(self.cfg.get("swipe_frac_x", 0.12), self.cfg.get("swipe_frac_y", 0.12)):
+            if abs(lx - sx) >= abs(ly - sy):
+                name = "swipe_right" if lx > sx else "swipe_left"
+            else:
+                name = "swipe_down" if ly > sy else "swipe_up"
+        elif ss > 1e-6:
+            ratio = ls / ss
+            if ratio >= self.cfg.get("pinch_out_ratio", 1.22):
+                name = "pinch_out"
+            elif ratio <= self.cfg.get("pinch_in_ratio", 0.82):
+                name = "pinch_in"
+        if not name:
+            return
+        n = self.fingers
+        mp = self.cfg["map"]
+        action = mp.get(f"{n}_{name}", mp.get(name, "none"))
+        # repeatable actions scale with how far you swiped
+        repeatable = {
+            "volume_up", "volume_down", "brightness_up", "brightness_down",
+            "zoom_in", "zoom_out",
+        }
+        dist = max(mx, my)
+        steps = 1
+        if action in repeatable:
+            step_frac = float(self.cfg.get("step_frac", 0.10)) or 0.10
+            steps = max(1, min(int(round(dist / step_frac)), int(self.cfg.get("max_steps", 20))))
+        log(f"gesture {n}f {name} -> {action}" + (f" x{steps}" if steps > 1 else ""))
+        if self.bus is not None:
+            self.bus.send({"t": "gesture", "fingers": n, "gesture": name,
+                           "action": action, "steps": steps})
+        for _ in range(steps):
+            run_action(action)
+            if steps > 1:
+                time.sleep(0.03)
+
+
+# --------------------------------------------------------------------------- device
+def find_touchscreen(name: str):
+    import glob
+
+    for path in sorted(glob.glob("/dev/input/event*")):
+        try:
+            fd = open(path, "rb", buffering=0)
+        except OSError:
+            continue
+        try:
+            dev = libevdev.Device(fd)
+            if (
+                (dev.name or "") == name
+                and dev.has(EV_ABS.ABS_MT_SLOT)
+                and dev.has(EV_ABS.ABS_MT_POSITION_X)
+                and dev.has(EV_KEY.BTN_TOUCH)
+            ):
+                return path, dev, fd
+        except Exception:  # noqa: BLE001
+            pass
+        fd.close()
+    return "", None, None
+
+
+def main() -> int:
+    cfg = load_cfg()
+
+    def stop(*_a):
+        global _running
+        _running = False
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    if not cfg.get("enabled", False):
+        log("disabled in config; idling")
+        while _running:
+            time.sleep(60)
+        return 0
+
+    bus = None
+    if Broadcaster is not None and default_paths is not None:
+        bus = Broadcaster(default_paths()["gestures"])
+        log(f"event bus: {bus.path if bus.srv else 'unavailable'}")
+
+    name = cfg.get("touchscreen_name", DEFAULTS["touchscreen_name"])
+    while _running:
+        path, dev, fd = find_touchscreen(name)
+        if dev is None:
+            log(f"waiting for touchscreen '{name}'")
+            time.sleep(2)
+            continue
+
+        xi = dev.absinfo[EV_ABS.ABS_MT_POSITION_X]
+        yi = dev.absinfo[EV_ABS.ABS_MT_POSITION_Y]
+        engine = Gestures(cfg, (xi.minimum, xi.maximum), (yi.minimum, yi.maximum), bus=bus)
+        os.set_blocking(fd.fileno(), False)
+        log(f"reading {path} ({dev.name}); {MIN_FINGERS}-{MAX_FINGERS}-finger gestures active")
+
+        try:
+            while _running:
+                rlist = [fd] + (bus.socks() if bus else [])
+                try:
+                    r, _, _ = select.select(rlist, [], [], 5)
+                except OSError:
+                    r = [fd]
+                lost = False
+                for sock in r:
+                    if bus and sock is not fd:
+                        if bus.is_server(sock):
+                            bus.accept()
+                        else:
+                            bus.drain(sock)
+                        continue
+                    try:
+                        engine.feed(dev.events())
+                    except OSError as exc:
+                        log(f"device lost ({exc}); re-scanning")
+                        lost = True
+                if lost:
+                    break
+        finally:
+            try:
+                fd.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    if bus:
+        bus.close()
+    log("stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

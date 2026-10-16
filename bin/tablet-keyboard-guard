@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""tablet-keyboard-guard: disable the built-in keyboard while the lid is folded.
+
+This HP OmniBook X Flip exposes SW_TABLET_MODE on "Intel HID switches". When the
+lid is flipped past ~180 degrees the switch turns on, and the built-in keyboard
+is pressed against the table / your hands, so stray key presses land in whatever
+has focus. This daemon watches that switch and, while tablet mode is on,
+exclusively grabs (EVIOCGRAB) the internal keyboard so its events never reach
+KWin. Releasing the grab restores it instantly.
+
+Everything is user-space: the user is in the `input` group and the nodes are
+readable, so no root is needed. If this process dies the kernel drops the grab,
+so the keyboard can never get stuck disabled.
+
+Config: ~/.config/tablet-hub/config.json  (section "keyboard_guard")
+"""
+from __future__ import annotations
+
+import json
+import os
+import select
+import signal
+import sys
+import time
+
+import libevdev
+from libevdev import EV_SW
+
+CONFIG = os.path.expanduser("~/.config/tablet-hub/config.json")
+
+DEFAULTS = {
+    "enabled": True,
+    # evdev names to grab while folded. The built-in keyboard is the main one.
+    "keyboards": ["AT Translated Set 2 keyboard"],
+    # optionally also grab these while folded (touchpad is on the underside)
+    "touchpads": [],
+    "switch_device": "Intel HID switches",
+    "switch_code": "SW_TABLET_MODE",
+}
+
+_running = True
+
+
+def log(msg: str) -> None:
+    print(f"tablet-keyboard-guard: {msg}", flush=True)
+
+
+def load_cfg() -> dict:
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG) as fh:
+            data = json.load(fh)
+        cfg.update(data.get("keyboard_guard", {}))
+    except FileNotFoundError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        log(f"config read failed ({exc}); using defaults")
+    return cfg
+
+
+def find_device(pred) -> tuple[str, libevdev.Device, object]:
+    """Return (path, device, fd) for the first event node matching pred(device)."""
+    import glob
+
+    for path in sorted(glob.glob("/dev/input/event*")):
+        try:
+            fd = open(path, "rb", buffering=0)
+        except OSError:
+            continue
+        try:
+            dev = libevdev.Device(fd)
+            if pred(dev):
+                return path, dev, fd
+        except Exception:  # noqa: BLE001
+            pass
+        fd.close()
+    return "", None, None
+
+
+class Guard:
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.held: dict[str, libevdev.Device] = {}
+        self.held_descs: dict[str, str] = {}
+        self.tablet = None
+
+    # -- device selection ------------------------------------------------------
+    def _wanted_names(self) -> list[str]:
+        names = list(self.cfg.get("keyboards", []))
+        names.extend(self.cfg.get("touchpads", []))
+        return [n for n in names if n]
+
+    def _should_grab(self, name: str) -> bool:
+        # prefix match, so a live re-emit like "AT Translated Set 2 keyboard
+        # (vocalinux)" is caught alongside the physical node.
+        return any(name.startswith(w) for w in self._wanted_names())
+
+    # -- grab / release --------------------------------------------------------
+    def engage(self) -> None:
+        """Grab every matching, not-yet-held node; drop any that vanished.
+
+        Note: the physical node may already be exclusively held by another tool
+        (vocalinux grabs it and re-emits a clone). Grabbing that clone is what
+        actually stops events reaching the compositor, so we grab every live
+        node whose name matches instead of insisting on the physical one.
+        """
+        import glob
+
+        # drop devices that disappeared
+        for path in list(self.held):
+            if not os.path.exists(path):
+                dev = self.held.pop(path)
+                self.held_descs.pop(path, None)
+                try:
+                    dev.fd.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        newly = False
+        for path in sorted(glob.glob("/dev/input/event*")):
+            if path in self.held:
+                continue
+            try:
+                fd = open(path, "rb", buffering=0)
+            except OSError:
+                continue
+            try:
+                dev = libevdev.Device(fd)
+                if not self._should_grab(dev.name or ""):
+                    fd.close()
+                    continue
+                dev.grab()
+                self.held[path] = dev
+                self.held_descs[path] = f"{dev.name} ({path})"
+                newly = True
+            except Exception as exc:  # noqa: BLE001
+                # EBUSY/DeviceGrabError means another process owns this node
+                # exclusively; that is expected for the physical node when a
+                # re-emitter like vocalinux holds it.
+                log(f"grab skipped on {path}: {type(exc).__name__}")
+                try:
+                    fd.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        if newly:
+            log("tablet mode ON - keyboard disabled: " + ", ".join(self.held_descs.values()))
+
+    def release(self) -> None:
+        if not self.held:
+            return
+        for dev in self.held.values():
+            try:
+                dev.ungrab()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                dev.fd.close()
+            except Exception:  # noqa: BLE001
+                pass
+        log("tablet mode OFF - keyboard restored: " + ", ".join(self.held_descs.values()))
+        self.held.clear()
+        self.held_descs.clear()
+
+    def apply(self, on: bool) -> None:
+        self.tablet = on
+        if on:
+            self.engage()
+        else:
+            self.release()
+
+
+def switch_value(dev: libevdev.Device, cfg: dict):
+    code = getattr(EV_SW, cfg["switch_code"], EV_SW.SW_TABLET_MODE)
+    if not dev.has(code):
+        return None
+    return dev.value[code]
+
+
+def main() -> int:
+    cfg = load_cfg()
+    args = sys.argv[1:]
+
+    if "--status" in args:
+        path, dev, fd = find_device(
+            lambda d: (d.name or "") == cfg["switch_device"]
+            and getattr(d, "has", lambda c: False)(
+                getattr(EV_SW, cfg["switch_code"], EV_SW.SW_TABLET_MODE)
+            )
+        )
+        if dev is None:
+            print("tablet_mode=unknown (switch device not found)")
+            return 1
+        print(f"tablet_mode={int(bool(switch_value(dev, cfg)))}")
+        return 0
+
+    if "--force" in args:
+        i = args.index("--force")
+        on = i + 1 < len(args) and args[i + 1] == "on"
+        guard = Guard(cfg)
+        guard.apply(on)
+        return 0
+
+    log(f"starting (config: {CONFIG}, enabled={cfg.get('enabled')})")
+
+    def stop(*_a):
+        global _running
+        _running = False
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    guard = Guard(cfg)
+    if not cfg.get("enabled", True):
+        log("disabled in config; idling")
+        while _running:
+            time.sleep(60)
+        return 0
+
+    while _running:
+        path, dev, fd = find_device(
+            lambda d: (d.name or "") == cfg["switch_device"]
+            and getattr(d, "has", lambda c: False)(
+                getattr(EV_SW, cfg["switch_code"], EV_SW.SW_TABLET_MODE)
+            )
+        )
+        if dev is None:
+            log(f"waiting for '{cfg['switch_device']}' with {cfg['switch_code']}")
+            time.sleep(2)
+            continue
+
+        val = switch_value(dev, cfg)
+        guard.apply(bool(val))
+        log(f"watching {path} ({dev.name}); tablet_mode={bool(val)}")
+        os.set_blocking(fd.fileno(), False)
+
+        try:
+            while _running:
+                r, _, _ = select.select([fd], [], [], 3)
+                if not r:
+                    # periodically re-scan so a keyboard that appears (or a
+                    # re-emitter like vocalinux restarting) is caught too.
+                    if guard.tablet:
+                        guard.engage()
+                    continue
+                try:
+                    for e in dev.events():
+                        if e.matches(EV_SW):
+                            code = getattr(EV_SW, cfg["switch_code"], EV_SW.SW_TABLET_MODE)
+                            if e.code == code and e.value in (0, 1):
+                                guard.apply(bool(e.value))
+                except OSError as exc:
+                    log(f"switch device lost ({exc}); re-scanning")
+                    break
+        finally:
+            try:
+                dev.ungrab()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                fd.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    guard.release()
+    log("stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,12 @@
+[Unit]
+Description=Stylus button + drag-scroll behaviour (user service)
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/pen-scroll
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

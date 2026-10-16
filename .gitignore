@@ -1,0 +1,12 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Editors / OS
+*.swp
+*~
+.DS_Store
+
+# Local overrides
+config.local.json

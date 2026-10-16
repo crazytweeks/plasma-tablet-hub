@@ -1,0 +1,480 @@
+#!/usr/bin/env python3
+"""pen-scroll: configurable stylus button + drag-scroll behaviour for a pen.
+
+KWin turns a pen into a plain pointer and gives no way to scroll with it. This
+daemon takes exclusive control of the stylus evdev node and re-emits it through
+a virtual copy of the tablet, so it can reinterpret the pen's buttons and motion.
+
+Configurable (see ~/.config/tablet-hub/config.json -> "pen_scroll"):
+
+  button1 / button2   action for each side button:
+                        left_click | right_click | middle_click | scroll |
+                        disabled | eraser (native tool switch)
+  tip_scroll          if true, dragging the pen tip scrolls (like a finger)
+  invert              flip the scroll direction
+  mm_per_notch        pen travel per wheel notch (smaller = faster)
+  start_mm            movement before a held button/tip scrolls instead of clicks
+
+button1 is the front side button (BTN_STYLUS). button2 is the rear side button:
+the pen firmware reports it as a switch to the "eraser" tool, so setting
+button2 to "eraser" restores the native eraser behaviour.
+
+While a "scroll" trigger is held (or the tip is dragged, if tip_scroll), motion
+becomes horizontal/vertical wheel events and the cursor stays put. Click actions
+emit real mouse buttons on a virtual pointer, so press-and-drag selects work.
+
+If the process dies the kernel drops the grab, so the pen always reverts to the
+system's own handling. User-space only (input group + /dev/uinput ACL).
+"""
+from __future__ import annotations
+
+import glob
+import json
+import math
+import os
+import select
+import signal
+import sys
+import time
+
+import libevdev
+from libevdev import EV_ABS, EV_KEY, EV_REL, EV_SYN, InputEvent
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from tabhub_bus import Broadcaster, default_paths  # type: ignore
+except Exception:  # noqa: BLE001
+    Broadcaster = None  # type: ignore
+    default_paths = None  # type: ignore
+
+CONFIG = os.path.expanduser("~/.config/tablet-hub/config.json")
+DEFAULT_NAME = "ELAN2514:00 04F3:442A Stylus"
+CLONE_SUFFIX = " (pen-scroll)"
+FALLBACK_SIZE_MM = (300.0, 188.0)
+
+SYN = InputEvent(EV_SYN.SYN_REPORT, 0)
+CLICKS = {"left_click": EV_KEY.BTN_LEFT, "right_click": EV_KEY.BTN_RIGHT, "middle_click": EV_KEY.BTN_MIDDLE}
+TOOL_CODES = {
+    EV_KEY.BTN_TOOL_PEN, EV_KEY.BTN_TOOL_RUBBER, EV_KEY.BTN_TOOL_MOUSE,
+    EV_KEY.BTN_TOOL_LENS, EV_KEY.BTN_TOUCH,
+}
+
+DEFAULTS = {
+    "stylus_name": DEFAULT_NAME,
+    "button1": "left_click",
+    "button2": "right_click",
+    "tip_scroll": False,
+    "invert": False,
+    "mm_per_notch": 6.0,
+    "start_mm": 1.5,
+}
+
+_running = True
+
+
+def log(msg: str) -> None:
+    print(f"pen-scroll: {msg}", flush=True)
+
+
+def load_cfg() -> dict:
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG) as fh:
+            cfg.update(json.load(fh).get("pen_scroll", {}))
+    except FileNotFoundError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        log(f"config read failed ({exc}); using defaults")
+    # environment overrides (kept for compatibility with the old unit)
+    if os.environ.get("PEN_SCROLL_STYLUS_NAME"):
+        cfg["stylus_name"] = os.environ["PEN_SCROLL_STYLUS_NAME"]
+    if os.environ.get("PEN_SCROLL_MM_PER_NOTCH"):
+        cfg["mm_per_notch"] = float(os.environ["PEN_SCROLL_MM_PER_NOTCH"])
+    if os.environ.get("PEN_SCROLL_START_MM"):
+        cfg["start_mm"] = float(os.environ["PEN_SCROLL_START_MM"])
+    if os.environ.get("PEN_SCROLL_INVERT"):
+        cfg["invert"] = os.environ["PEN_SCROLL_INVERT"] == "1"
+    cfg["mm_per_notch"] = float(cfg["mm_per_notch"])
+    cfg["start_mm"] = float(cfg["start_mm"])
+    return cfg
+
+
+def find_device(name: str):
+    for path in sorted(glob.glob("/dev/input/event*")):
+        try:
+            fd = open(path, "rb", buffering=0)
+        except OSError:
+            continue
+        try:
+            dev = libevdev.Device(fd)
+            if dev.name == name and dev.has(EV_KEY.BTN_STYLUS):
+                return path, dev, fd
+        except Exception:  # noqa: BLE001
+            pass
+        fd.close()
+    return None, None, None
+
+
+class PenScroll:
+    def __init__(self, dev, tablet, pointer, cfg, bus=None):
+        self.dev, self.tablet, self.pointer = dev, tablet, pointer
+        self.bus = bus
+        self._last_state = 0.0
+        self.mm_per_notch = cfg["mm_per_notch"]
+        self.start_mm = cfg["start_mm"]
+        self.sign = -1 if cfg["invert"] else 1
+        self.act = {1: cfg.get("button1", "left_click"), 2: cfg.get("button2", "right_click")}
+        self.tip_scroll = bool(cfg.get("tip_scroll", False))
+        self.scroll_button = 1 if self.act[1] == "scroll" else (2 if self.act[2] == "scroll" else None)
+
+        self.res = {}
+        for code, fallback in ((EV_ABS.ABS_X, FALLBACK_SIZE_MM[0]), (EV_ABS.ABS_Y, FALLBACK_SIZE_MM[1])):
+            info = dev.absinfo[code]
+            self.res[code] = info.resolution or (info.maximum / fallback)
+
+        self.abs = {c: dev.value[c] for c in (EV_ABS.ABS_X, EV_ABS.ABS_Y)}
+        self.touch = False
+        self.vtouch = False
+        self.phys = {1: False, 2: False}
+        self.click_down = {1: None, 2: None}
+        self.holding = False          # scroll active
+        self.moved = False
+        self.pending: set[int] = set()
+        self.anchor = (0, 0)
+        self.start = (0, 0)
+        self.tip_start = None
+        self.frac = {"y": 0.0, "x": 0.0}
+        self.notch = {"y": 0, "x": 0}
+        self.tip_suppressed = False
+
+        # The pen's *second* side button is reported by the firmware as a switch
+        # to the "eraser" tool (BTN_TOOL_PEN=0 followed by BTN_TOOL_RUBBER=1),
+        # never as BTN_STYLUS2. When the rear button is mapped to a normal
+        # action we intercept that toggle and emit the action instead of letting
+        # KWin enter eraser mode. Mapping button2 to "eraser" keeps it native.
+        self.rubber_button = 2 if self.act.get(2) != "eraser" else None
+        self.pen_out_pending = False
+        self.pen_out_deadline = 0.0
+        self.suppress_pen_in = False
+
+    # -- helpers ---------------------------------------------------------------
+    def emit(self, device, events):
+        if events:
+            device.send_events(events + [SYN])
+
+    def publish(self, obj):
+        if self.bus is not None:
+            self.bus.send(obj)
+
+    def publish_state(self):
+        now = time.monotonic()
+        if now - self._last_state < 0.03:
+            return
+        self._last_state = now
+        press = 0
+        try:
+            press = int(self.dev.value.get(EV_ABS.ABS_PRESSURE, 0))
+        except Exception:  # noqa: BLE001
+            press = 0
+        self.publish({
+            "t": "state",
+            "x": int(self.abs[EV_ABS.ABS_X]),
+            "y": int(self.abs[EV_ABS.ABS_Y]),
+            "p": press,
+            "touch": bool(self.touch),
+            "b1": bool(self.phys[1]),
+            "b2": bool(self.phys[2]),
+            "scroll": bool(self.holding),
+        })
+
+    def mm_from(self, ax, ay):
+        return ((self.abs[EV_ABS.ABS_X] - ax) / self.res[EV_ABS.ABS_X],
+                (self.abs[EV_ABS.ABS_Y] - ay) / self.res[EV_ABS.ABS_Y])
+
+    def scroll(self, dx_mm, dy_mm):
+        events = []
+        for axis, hires, notch, mm in (
+            ("y", EV_REL.REL_WHEEL_HI_RES, EV_REL.REL_WHEEL, self.sign * dy_mm),
+            ("x", EV_REL.REL_HWHEEL_HI_RES, EV_REL.REL_HWHEEL, -self.sign * dx_mm),
+        ):
+            self.frac[axis] += mm / self.mm_per_notch * 120
+            hi = int(self.frac[axis])
+            self.frac[axis] -= hi
+            if not hi:
+                continue
+            events.append(InputEvent(hires, hi))
+            self.notch[axis] += hi
+            whole = int(self.notch[axis] / 120)
+            if whole:
+                events.append(InputEvent(notch, whole))
+                self.notch[axis] -= whole * 120
+        self.emit(self.pointer, events)
+
+    # -- scroll state ----------------------------------------------------------
+    def begin_scroll(self):
+        self.holding, self.moved = True, False
+        who = f"button {self.scroll_button}" if self.scroll_button else "tip drag"
+        self.publish({"t": "action", "label": f"Scroll ({who})"})
+        self.anchor = self.start = (self.abs[EV_ABS.ABS_X], self.abs[EV_ABS.ABS_Y])
+        self.frac = {"y": 0.0, "x": 0.0}
+        self.notch = {"y": 0, "x": 0}
+        if self.vtouch:
+            self.emit(self.tablet, [InputEvent(EV_KEY.BTN_TOUCH, 0), InputEvent(EV_ABS.ABS_PRESSURE, 0)])
+            self.vtouch = False
+        if self.touch:
+            self.tip_suppressed = True
+
+    def end_scroll(self):
+        self.holding = False
+        resync = [InputEvent(c, self.abs[c]) for c in self.pending if c in self.abs and c != EV_ABS.ABS_PRESSURE]
+        self.pending.clear()
+        self.emit(self.tablet, resync)
+        if self.touch:
+            self.tip_suppressed = True
+
+    def click(self, index, down):
+        code = CLICKS.get(self.act[index])
+        if code is None:
+            return
+        if down:
+            if self.click_down[index] is None:
+                self.click_down[index] = code
+                self.emit(self.pointer, [InputEvent(code, 1)])
+                self.publish({"t": "action", "label": f"Button {index} \u2192 {self.act[index].replace('_', ' ')}"})
+        else:
+            if self.click_down[index] is not None:
+                self.emit(self.pointer, [InputEvent(code, 0)])
+                self.click_down[index] = None
+
+    def release_all(self):
+        self.click(1, False)
+        self.click(2, False)
+        self.phys[1] = self.phys[2] = False
+        if self.holding:
+            self.holding = False
+
+    def flush_pen_out(self):
+        """Emit the deferred proximity exit (the pen really left the surface)."""
+        self.pen_out_pending = False
+        self.suppress_pen_in = False
+        self.release_all()
+        self.pending.clear()
+        self.tip_start = None
+        self.emit(self.tablet, [InputEvent(EV_KEY.BTN_TOOL_PEN, 0)])
+
+    def tick(self):
+        if self.pen_out_pending and time.monotonic() >= self.pen_out_deadline:
+            self.flush_pen_out()
+
+    # -- one SYN_REPORT frame --------------------------------------------------
+    def handle(self, frame):
+        press = {1: False, 2: False}
+        release = {1: False, 2: False}
+        prox_out = False
+        saw_pen_out = False
+        saw_pen_in = False
+        saw_rubber = False
+        fwd = []
+        for e in frame:
+            if e.matches(EV_KEY.BTN_STYLUS):
+                press[1] = e.value == 1 or press[1]
+                release[1] = e.value == 0 or release[1]
+                self.publish({"t": "action", "label": f"[raw] BTN_STYLUS = {e.value}"})
+                continue
+            if e.matches(EV_KEY.BTN_STYLUS2):
+                press[2] = e.value == 1 or press[2]
+                release[2] = e.value == 0 or release[2]
+                self.publish({"t": "action", "label": f"[raw] BTN_STYLUS2 = {e.value}"})
+                continue
+            if e.matches(EV_ABS):
+                self.abs[e.code] = e.value
+            elif e.matches(EV_KEY.BTN_TOUCH):
+                self.touch = bool(e.value)
+                self.publish({"t": "action", "label": "Tip pressed" if e.value else "Tip released"})
+            elif e.matches(EV_KEY.BTN_TOOL_RUBBER):
+                saw_rubber = True
+                if self.rubber_button is not None:
+                    if e.value:
+                        press[self.rubber_button] = True
+                    else:
+                        release[self.rubber_button] = True
+                    self.publish({"t": "action",
+                                  "label": f"Rear button {'down' if e.value else 'up'}"})
+                    continue
+                if e.value == 0:
+                    prox_out = True
+            elif e.matches(EV_KEY.BTN_TOOL_PEN) and self.rubber_button is not None:
+                if e.value == 0:
+                    saw_pen_out = True
+                    continue  # defer: may be the start of a rear-button press
+                saw_pen_in = True
+                if self.suppress_pen_in:
+                    self.suppress_pen_in = False
+                    continue
+            elif (e.matches(EV_KEY.BTN_TOOL_PEN) or e.matches(EV_KEY.BTN_TOOL_RUBBER)) and e.value == 0:
+                prox_out = True
+            elif e.matches(EV_KEY) and e.code not in TOOL_CODES:
+                try:
+                    kn = libevdev.evbit(e.code).name
+                except Exception:  # noqa: BLE001
+                    kn = str(e.code)
+                self.publish({"t": "action", "label": f"[raw] {kn} = {e.value}"})
+            fwd.append(e)
+
+        # --- resolve a deferred proximity exit vs. a rear-button press ---
+        if self.rubber_button is not None:
+            if saw_rubber:
+                self.pen_out_pending = False   # the pen-out was a button, not an exit
+                self.suppress_pen_in = True    # swallow the matching TOOL_PEN=1
+            elif saw_pen_out:
+                if not self.pen_out_pending:
+                    self.pen_out_pending = True
+                    self.pen_out_deadline = time.monotonic() + 0.04
+            elif saw_pen_in and self.pen_out_pending:
+                self.flush_pen_out()
+
+        # --- button transitions ---
+        for i in (1, 2):
+            if press[i] and not self.phys[i]:
+                self.phys[i] = True
+                if self.act[i] == "scroll" and self.scroll_button == i:
+                    self.begin_scroll()
+                elif self.act[i] in CLICKS:
+                    self.click(i, True)
+            if release[i] and self.phys[i]:
+                self.phys[i] = False
+                if self.act[i] == "scroll" and self.scroll_button == i:
+                    self.end_scroll()
+                elif self.act[i] in CLICKS:
+                    self.click(i, False)
+
+        if prox_out:
+            self.release_all()
+            self.pending.clear()
+            self.tip_start = None
+
+        # --- tip drag scroll (optional) ---
+        if self.tip_scroll and not any(self.phys.values()):
+            if self.touch and not self.holding:
+                if self.tip_start is None:
+                    self.tip_start = (self.abs[EV_ABS.ABS_X], self.abs[EV_ABS.ABS_Y])
+                sx, sy = self.mm_from(*self.tip_start)
+                if math.hypot(sx, sy) >= self.start_mm:
+                    self.begin_scroll()
+            if not self.touch:
+                if self.holding and self.scroll_button is None:
+                    self.end_scroll()
+                self.tip_start = None
+
+        any_click_held = any(v is not None for v in self.click_down.values())
+
+        if self.holding:
+            for e in fwd:
+                if e.matches(EV_ABS):
+                    self.pending.add(e.code)
+            fwd = [e for e in fwd if e.matches(EV_KEY.BTN_TOOL_PEN) or e.matches(EV_KEY.BTN_TOOL_RUBBER)]
+            dx, dy = self.mm_from(*self.anchor)
+            if not self.moved:
+                sx, sy = self.mm_from(*self.start)
+                if math.hypot(sx, sy) >= self.start_mm:
+                    self.moved = True
+            if self.moved and (dx or dy):
+                self.anchor = (self.abs[EV_ABS.ABS_X], self.abs[EV_ABS.ABS_Y])
+                self.scroll(dx, dy)
+        else:
+            if self.tip_suppressed or any_click_held:
+                # keep the cursor moving (press-and-drag) but don't double the tip
+                fwd = [e for e in fwd if not (e.matches(EV_KEY.BTN_TOUCH) or e.matches(EV_ABS.ABS_PRESSURE))]
+                if not self.touch and not any_click_held:
+                    self.tip_suppressed = False
+
+        for e in fwd:
+            if e.matches(EV_KEY.BTN_TOUCH):
+                self.vtouch = bool(e.value)
+        self.emit(self.tablet, fwd)
+        self.publish_state()
+
+
+def make_pointer(name):
+    m = libevdev.Device()
+    m.name = name
+    for c in (EV_REL.REL_X, EV_REL.REL_Y, EV_REL.REL_WHEEL, EV_REL.REL_HWHEEL,
+              EV_REL.REL_WHEEL_HI_RES, EV_REL.REL_HWHEEL_HI_RES):
+        m.enable(c)
+    for c in (EV_KEY.BTN_LEFT, EV_KEY.BTN_RIGHT, EV_KEY.BTN_MIDDLE):
+        m.enable(c)
+    return m.create_uinput_device()
+
+
+def main() -> int:
+    cfg = load_cfg()
+    if "--show-config" in sys.argv:
+        print(json.dumps(cfg, indent=2))
+        return 0
+
+    def stop(*_a):
+        global _running
+        _running = False
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    log(f"waiting for '{cfg['stylus_name']}'")
+    while _running:
+        path, dev, fd = find_device(cfg["stylus_name"])
+        if dev:
+            break
+        time.sleep(2)
+    if dev is None:
+        return 0
+
+    os.set_blocking(fd.fileno(), False)
+    dev.grab()
+    dev.name = cfg["stylus_name"] + CLONE_SUFFIX
+    tablet = dev.create_uinput_device()
+    pointer = make_pointer("pen-scroll pointer")
+    log(f"grabbed {path}; tablet {tablet.devnode}, pointer {pointer.devnode}; "
+        f"button1={cfg['button1']} button2={cfg['button2']} tip_scroll={cfg['tip_scroll']}")
+
+    bus = None
+    if Broadcaster is not None and default_paths is not None:
+        bus = Broadcaster(default_paths()["pen"])
+        log(f"event bus: {bus.path if bus.srv else 'unavailable'}")
+
+    ps = PenScroll(dev, tablet, pointer, cfg, bus=bus)
+    frame = []
+    while _running:
+        rlist = [fd] + (bus.socks() if bus else [])
+        try:
+            r, _, _ = select.select(rlist, [], [], 0.02)
+        except OSError:
+            r = [fd]
+        for sock in r:
+            if bus and sock is not fd:
+                if bus.is_server(sock):
+                    bus.accept()
+                else:
+                    bus.drain(sock)
+                continue
+            try:
+                for e in dev.events():
+                    if e.matches(EV_SYN.SYN_DROPPED):
+                        frame.clear()
+                    elif e.matches(EV_SYN.SYN_REPORT):
+                        ps.handle(frame)
+                        frame = []
+                    else:
+                        frame.append(e)
+            except OSError as exc:
+                log(f"device lost ({exc}); exiting for restart")
+                sys.exit(1)
+        ps.tick()
+    ps.release_all()
+    if bus:
+        bus.close()
+    log("stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

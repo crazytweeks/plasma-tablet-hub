@@ -1,0 +1,926 @@
+#!/usr/bin/env python3
+"""tablet-hub: a system-tray control panel for using this 2-in-1 as a tablet.
+
+Hub for the user-space daemons that make a convertible laptop usable in tablet
+mode:
+
+  * tablet-keyboard-guard : disables the built-in keyboard while folded
+  * pen-scroll            : configurable stylus buttons + drag scrolling
+  * tabhub-gestures       : 3/4/5-finger touchscreen gestures
+
+Tap the tray icon for a finger-sized panel; right-click for the compact menu.
+All privileged/service work runs off the GUI thread, so the panel never freezes.
+User-space only; the single privileged action is retiring a legacy root
+pen-scroll.service.
+
+Config: ~/.config/tablet-hub/config.json
+"""
+from __future__ import annotations
+
+import glob
+import json
+import os
+import subprocess
+import sys
+import threading
+
+from PyQt6.QtCore import QObject, QRectF, QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap
+from PyQt6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFormLayout,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QMenu,
+    QMessageBox,
+    QPlainTextEdit,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSystemTrayIcon,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from tabhub_actions import ACTIONS as ACTION_LABELS  # type: ignore
+except Exception:  # noqa: BLE001
+    ACTION_LABELS = {"none": "Nothing"}
+try:
+    from tabhub_bus import Client as BusClient, default_paths as bus_paths  # type: ignore
+except Exception:  # noqa: BLE001
+    BusClient = None  # type: ignore
+    bus_paths = None  # type: ignore
+
+HOME = os.path.expanduser("~")
+CONFIG_PATH = os.path.join(HOME, ".config/tablet-hub/config.json")
+BIN = os.path.join(HOME, ".local/bin")
+ROTATE = os.path.join(BIN, "rotate-screen")
+VERSION_PATH = os.path.join(HOME, ".local/share/tablet-hub/VERSION")
+
+
+def read_version() -> str:
+    try:
+        with open(VERSION_PATH, encoding="utf-8") as fh:
+            return fh.read().strip() or "dev"
+    except OSError:
+        return "dev"
+
+
+APP_VERSION = read_version()
+
+ACCENT = "#3daee9"
+MUTED = "#7f8c8d"
+SWITCH_NAME = "Intel HID switches"
+
+BUTTON_ACTIONS = [
+    ("left_click", "Left click (select)"),
+    ("right_click", "Right click"),
+    ("middle_click", "Middle click"),
+    ("scroll", "Scroll (hold to scroll)"),
+    ("eraser", "Eraser (native tool)"),
+    ("disabled", "Disabled"),
+]
+
+GESTURE_ROWS = [
+    ("swipe_left", "Swipe left"),
+    ("swipe_right", "Swipe right"),
+    ("swipe_up", "Swipe up"),
+    ("swipe_down", "Swipe down"),
+    ("pinch_out", "Pinch out"),
+    ("pinch_in", "Pinch in"),
+]
+GESTURE_FINGERS = [3, 4, 5]
+
+DEFAULTS = {
+    "keyboard_guard": {
+        "enabled": True,
+        "keyboards": ["AT Translated Set 2 keyboard"],
+        "touchpads": [],
+        "switch_device": SWITCH_NAME,
+        "switch_code": "SW_TABLET_MODE",
+    },
+    "pen_scroll": {
+        "enabled": True,
+        "stylus_name": "ELAN2514:00 04F3:442A Stylus",
+        "button1": "left_click",
+        "button2": "right_click",
+        "tip_scroll": True,
+        "mm_per_notch": 6.0,
+        "invert": False,
+        "start_mm": 1.5,
+    },
+    "gestures": {"enabled": False, "touchscreen_name": "ELAN2514:00 04F3:442A", "map": {}},
+    "effects": {"touch_points": True, "show_click": False},
+}
+
+
+# --------------------------------------------------------------------------- primitives
+def run(cmd: list[str], timeout: int = 12) -> tuple[int, str]:
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except FileNotFoundError:
+        return 127, f"{cmd[0]}: not found"
+    except subprocess.TimeoutExpired:
+        return 124, "timed out"
+
+
+def userctl(*args: str) -> tuple[int, str]:
+    return run(["systemctl", "--user", *args])
+
+
+def kwin_effects(*args: str) -> None:
+    run(["qdbus6", "org.kde.KWin", "/Effects", "org.kde.kwin.Effects", *args])
+
+
+def reconfigure_kwin() -> None:
+    run(["qdbus6", "org.kde.KWin", "/KWin", "org.kde.KWin.reconfigure"])
+
+
+def kwinrc_set(group: str, key: str, value: str) -> None:
+    run(["kwriteconfig6", "--file", "kwinrc", "--group", group, "--key", key, "--type", "bool", value])
+
+
+def load_config() -> dict:
+    cfg = json.loads(json.dumps(DEFAULTS))
+    try:
+        with open(CONFIG_PATH) as fh:
+            user = json.load(fh)
+        for section, values in user.items():
+            if isinstance(values, dict) and isinstance(cfg.get(section), dict):
+                cfg[section].update(values)
+            else:
+                cfg[section] = values
+    except FileNotFoundError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        print(f"tablet-hub: config read failed: {exc}", file=sys.stderr)
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(cfg, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, CONFIG_PATH)
+
+
+_switch_path: str | None = None
+
+
+def _read_switch_at(path: str) -> tuple[bool, bool | None]:
+    import libevdev
+    from libevdev import EV_SW
+
+    try:
+        fd = open(path, "rb", buffering=0)
+    except OSError:
+        return False, None
+    try:
+        dev = libevdev.Device(fd)
+        if (dev.name or "") == SWITCH_NAME and dev.has(EV_SW.SW_TABLET_MODE):
+            return True, bool(dev.value[EV_SW.SW_TABLET_MODE])
+    except Exception:  # noqa: BLE001
+        return False, None
+    finally:
+        fd.close()
+    return False, None
+
+
+def tablet_mode() -> bool | None:
+    global _switch_path
+    if _switch_path:
+        found, val = _read_switch_at(_switch_path)
+        if found:
+            return val
+        _switch_path = None
+    for path in sorted(glob.glob("/dev/input/event*")):
+        found, val = _read_switch_at(path)
+        if found:
+            _switch_path = path
+            return val
+    return None
+
+
+def pen_scroll_user_present() -> bool:
+    return os.path.exists(os.path.join(HOME, ".config/systemd/user/pen-scroll.service"))
+
+
+def migrate_pen_scroll() -> tuple[bool, str]:
+    if not os.path.exists(os.path.join(HOME, ".config/systemd/user/pen-scroll.service")):
+        return False, "pen-scroll user service missing; run install.sh"
+    rc, out = run(["pkexec", "systemctl", "disable", "--now", "pen-scroll"], timeout=120)
+    if rc != 0:
+        return False, ("Could not stop the legacy root service "
+                       f"({out or 'authorisation cancelled'}).\n\n"
+                       "Run once:  sudo systemctl disable --now pen-scroll")
+    userctl("daemon-reload")
+    userctl("enable", "--now", "pen-scroll.service")
+    return True, "pen-scroll is now a user service."
+
+
+# --------------------------------------------------------------------------- icons
+def _draw_glyph(size: int, folded: bool) -> QPixmap:
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    color = QColor(ACCENT if folded else MUTED)
+    w = max(1.5, size * 0.075)
+    p.setPen(QPen(color, w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+    body = QRectF(size * 0.20, size * 0.12, size * 0.60, size * 0.76)
+    if folded:
+        p.setBrush(QColor(color.red(), color.green(), color.blue(), 55))
+    p.drawRoundedRect(body, size * 0.10, size * 0.10)
+    p.drawLine(int(size * 0.42), int(size * 0.80), int(size * 0.58), int(size * 0.80))
+    p.setPen(QPen(color if folded else QColor(MUTED), w, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    p.drawLine(int(size * 0.66), int(size * 0.78), int(size * 0.92), int(size * 0.20))
+    p.end()
+    return pm
+
+
+def tray_icon(folded: bool | None) -> QIcon:
+    icon = QIcon()
+    for s in (16, 22, 24, 32, 48, 64):
+        icon.addPixmap(_draw_glyph(s, folded is True))
+    return icon
+
+
+def themed(name: str) -> QIcon:
+    return QIcon.fromTheme(name)
+
+
+# --------------------------------------------------------------------------- bridge
+class Bridge(QObject):
+    refresh = pyqtSignal()
+    info = pyqtSignal(str, str)
+
+
+# --------------------------------------------------------------------------- settings dialog
+class SettingsDialog(QDialog):
+    def __init__(self, cfg: dict, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.setWindowTitle("Tablet Hub settings")
+        self.resize(560, 520)
+        tabs = QTabWidget(self)
+        tabs.addTab(self._tablet_tab(), "Tablet mode")
+        tabs.addTab(self._pen_tab(), "Pen")
+        tabs.addTab(self._gestures_tab(), "Gestures")
+        tabs.addTab(self._feedback_tab(), "Feedback")
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addWidget(tabs)
+        layout.addWidget(buttons)
+
+    def _tablet_tab(self) -> QWidget:
+        w = QWidget()
+        form = QFormLayout(w)
+        k = self.cfg["keyboard_guard"]
+        self.kg_enabled = QCheckBox("Disable the built-in keyboard while folded")
+        self.kg_enabled.setChecked(bool(k.get("enabled", True)))
+        self.kg_touchpad = QCheckBox("Also disable the touchpad while folded")
+        self.kg_touchpad.setChecked(bool(k.get("touchpads")))
+        form.addRow(self.kg_enabled)
+        form.addRow(self.kg_touchpad)
+        form.addRow(QLabel("Detection uses the SW_TABLET_MODE switch (flips when the\nlid is folded past ~180°)."))
+        return w
+
+    def _pen_tab(self) -> QWidget:
+        w = QWidget()
+        form = QFormLayout(w)
+        p = self.cfg["pen_scroll"]
+        self.pen_enabled = QCheckBox("Enable pen scrolling / buttons")
+        self.pen_enabled.setChecked(bool(p.get("enabled", True)))
+        self.btn1 = self._button_combo(p.get("button1", "left_click"))
+        self.btn2 = self._button_combo(p.get("button2", "right_click"))
+        self.tip_scroll = QCheckBox("Drag the pen tip to scroll (no button needed)")
+        self.tip_scroll.setChecked(bool(p.get("tip_scroll", False)))
+        self.pen_speed = QDoubleSpinBox()
+        self.pen_speed.setRange(1.0, 40.0)
+        self.pen_speed.setSingleStep(0.5)
+        self.pen_speed.setSuffix(" mm / notch")
+        self.pen_speed.setValue(float(p.get("mm_per_notch", 6.0)))
+        self.pen_invert = QCheckBox("Invert scroll direction")
+        self.pen_invert.setChecked(bool(p.get("invert", False)))
+        self.pen_start = QDoubleSpinBox()
+        self.pen_start.setRange(0.0, 10.0)
+        self.pen_start.setSingleStep(0.25)
+        self.pen_start.setSuffix(" mm")
+        self.pen_start.setValue(float(p.get("start_mm", 1.5)))
+        form.addRow(self.pen_enabled)
+        form.addRow("Front button action:", self.btn1)
+        form.addRow("Rear button action:", self.btn2)
+        form.addRow(QLabel("Front = the side button nearer the tip. Rear = the other\n"
+                           "side button (the pen reports it as an eraser; pick\n"
+                           "\"Eraser (native tool)\" to keep erasing in drawing apps)."))
+        form.addRow(self.tip_scroll)
+        form.addRow("Scroll speed:", self.pen_speed)
+        form.addRow(self.pen_invert)
+        form.addRow("Scroll activation distance:", self.pen_start)
+        return w
+
+    def _button_combo(self, current: str) -> QComboBox:
+        c = QComboBox()
+        for key, label in BUTTON_ACTIONS:
+            c.addItem(label, key)
+        i = c.findData(current)
+        c.setCurrentIndex(i if i >= 0 else 0)
+        return c
+
+    def _gestures_tab(self) -> QWidget:
+        outer = QWidget()
+        v = QVBoxLayout(outer)
+        g = self.cfg["gestures"]
+        self.g_enabled = QCheckBox("Enable multi-finger touchscreen gestures")
+        self.g_enabled.setChecked(bool(g.get("enabled", False)))
+        v.addWidget(self.g_enabled)
+        v.addWidget(QLabel("Choose an action for each gesture and finger count:"))
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        grid = QGridLayout(inner)
+        grid.addWidget(QLabel("<b>Gesture</b>"), 0, 0)
+        for col, n in enumerate(GESTURE_FINGERS, start=1):
+            grid.addWidget(QLabel(f"<b>{n} fingers</b>"), 0, col)
+        self.gmap: dict[tuple[int, str], QComboBox] = {}
+        gmap = g.get("map", {})
+        for row, (gid, label) in enumerate(GESTURE_ROWS, start=1):
+            grid.addWidget(QLabel(label), row, 0)
+            for col, n in enumerate(GESTURE_FINGERS, start=1):
+                c = QComboBox()
+                for key, alabel in ACTION_LABELS.items():
+                    c.addItem(alabel, key)
+                cur = gmap.get(f"{n}_{gid}", gmap.get(gid, "none"))
+                i = c.findData(cur)
+                c.setCurrentIndex(i if i >= 0 else 0)
+                grid.addWidget(c, row, col)
+                self.gmap[(n, gid)] = c
+        scroll.setWidget(inner)
+        v.addWidget(scroll)
+        return outer
+
+    def _feedback_tab(self) -> QWidget:
+        w = QWidget()
+        form = QFormLayout(w)
+        e = self.cfg["effects"]
+        self.eff_touch = QCheckBox("Touch points (ripple under each finger)")
+        self.eff_touch.setChecked(bool(e.get("touch_points", True)))
+        self.eff_click = QCheckBox("Show click (ring where the pointer clicks)")
+        self.eff_click.setChecked(bool(e.get("show_click", False)))
+        form.addRow(self.eff_touch)
+        form.addRow(self.eff_click)
+        form.addRow(QLabel("KWin desktop effects. Show click reacts to the pen as a\nleft click and may not react to the barrel button."))
+        return w
+
+    def result_config(self) -> dict:
+        cfg = self.cfg
+        cfg["keyboard_guard"]["enabled"] = self.kg_enabled.isChecked()
+        cfg["keyboard_guard"]["touchpads"] = (
+            ["ELAN012A:00 04F3:32ED Touchpad"] if self.kg_touchpad.isChecked() else []
+        )
+        p = cfg["pen_scroll"]
+        p["enabled"] = self.pen_enabled.isChecked()
+        p["button1"] = self.btn1.currentData()
+        p["button2"] = self.btn2.currentData()
+        p["tip_scroll"] = self.tip_scroll.isChecked()
+        p["mm_per_notch"] = self.pen_speed.value()
+        p["invert"] = self.pen_invert.isChecked()
+        p["start_mm"] = self.pen_start.value()
+        cfg["gestures"]["enabled"] = self.g_enabled.isChecked()
+        mp = cfg["gestures"].setdefault("map", {})
+        for (n, gid), combo in self.gmap.items():
+            mp[f"{n}_{gid}"] = combo.currentData()
+        cfg["effects"]["touch_points"] = self.eff_touch.isChecked()
+        cfg["effects"]["show_click"] = self.eff_click.isChecked()
+        return cfg
+
+
+# --------------------------------------------------------------------------- control panel
+class ControlPanel(QWidget):
+    def __init__(self, hub):
+        super().__init__()
+        self.hub = hub
+        self.setWindowTitle("Tablet Hub")
+        self.setMinimumWidth(470)
+        root = QVBoxLayout(self)
+        self.status = QLabel("Tablet mode: …")
+        f = QFont()
+        f.setPointSize(f.pointSize() + 2)
+        f.setBold(True)
+        self.status.setFont(f)
+        root.addWidget(self.status)
+
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        self.b_kb = self._toggle("Keyboard off when folded", "input-keyboard",
+                                 lambda on: hub.set_keyboard_guard(on))
+        self.b_pen = self._toggle("Pen scrolling", "draw-freehand",
+                                  lambda on: hub.set_pen_scroll(on))
+        self.b_touch = self._toggle("Touch points", "input-touchscreen",
+                                    lambda on: hub.set_effect("touch_points", on))
+        self.b_click = self._toggle("Show click", "tool-pointer",
+                                    lambda on: hub.set_effect("show_click", on))
+        self.b_gest = self._toggle("Multi-finger gestures", "input-touchscreen",
+                                   lambda on: hub.set_gestures(on))
+        for i, b in enumerate((self.b_kb, self.b_pen, self.b_touch, self.b_click, self.b_gest)):
+            grid.addWidget(b, i // 2, i % 2)
+        root.addLayout(grid)
+
+        root.addWidget(QLabel("Screen rotation"))
+        rot = QGridLayout()
+        rot.setSpacing(8)
+        for i, (label, name, icon) in enumerate((
+            ("Landscape", "normal", "object-flip-vertical"),
+            ("Portrait left", "left", "object-rotate-left"),
+            ("Inverted", "inverted", "object-flip-horizontal"),
+            ("Portrait right", "right", "object-rotate-right"),
+        )):
+            b = self._action(label, icon)
+            b.clicked.connect(lambda _=False, n=name: hub.rotate(n))
+            rot.addWidget(b, 0, i)
+        root.addLayout(rot)
+
+        bottom = QGridLayout()
+        b_settings = self._action("Settings…", "configure")
+        b_settings.clicked.connect(hub.open_settings)
+        b_tablet = self._action("Drawing Tablet…", "preferences-desktop-tablet")
+        b_tablet.clicked.connect(lambda: run(["kcmshell6", "kcm_tablet"]))
+        b_test = self._action("Live test…", "system-run")
+        b_test.clicked.connect(hub.open_test)
+        b_close = self._action("Close", "window-close")
+        b_close.clicked.connect(self.hide)
+        bottom.addWidget(b_settings, 0, 0)
+        bottom.addWidget(b_tablet, 0, 1)
+        bottom.addWidget(b_test, 0, 2)
+        bottom.addWidget(b_close, 1, 0, 1, 3)
+        root.addLayout(bottom)
+        self.refresh()
+
+    def _toggle(self, text, icon, cb) -> QPushButton:
+        b = QPushButton(text)
+        b.setCheckable(True)
+        b.setMinimumHeight(64)
+        b.setIcon(themed(icon))
+        b.setIconSize(QSize(28, 28))
+        b.clicked.connect(lambda: cb(b.isChecked()))
+        return b
+
+    def _action(self, text, icon) -> QPushButton:
+        b = QPushButton(text)
+        b.setMinimumHeight(52)
+        b.setIcon(themed(icon))
+        b.setIconSize(QSize(24, 24))
+        return b
+
+    def refresh(self) -> None:
+        tm = self.hub.tablet
+        self.status.setText({True: "Tablet mode: ON (folded)", False: "Tablet mode: OFF",
+                             None: "Tablet mode: unknown"}[tm])
+        c = self.hub.cfg
+        self.b_kb.setChecked(bool(c["keyboard_guard"].get("enabled", True)))
+        self.b_pen.setChecked(bool(c["pen_scroll"].get("enabled", True)))
+        self.b_pen.setEnabled(pen_scroll_user_present())
+        self.b_touch.setChecked(bool(c["effects"].get("touch_points")))
+        self.b_click.setChecked(bool(c["effects"].get("show_click")))
+        self.b_gest.setChecked(bool(c["gestures"].get("enabled")))
+
+
+# --------------------------------------------------------------------------- test window
+class StreamBridge(QObject):
+    message = pyqtSignal(dict)
+    status = pyqtSignal(bool)
+
+
+class PenPad(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setMinimumHeight(130)
+        self._p: tuple[float, float] | None = None
+
+    def set_pos(self, x: int, y: int, xr: int, yr: int) -> None:
+        self._p = (x / max(1, xr), y / max(1, yr))
+        self.update()
+
+    def paintEvent(self, _e) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self.rect()
+        p.setPen(QPen(QColor("#666"), 1))
+        p.drawRect(r.adjusted(0, 0, -1, -1))
+        if self._p:
+            x = r.left() + self._p[0] * r.width()
+            y = r.top() + self._p[1] * r.height()
+            p.setBrush(QColor(ACCENT))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(QRectF(x - 7, y - 7, 14, 14))
+
+
+class TestWindow(QWidget):
+    def __init__(self, hub):
+        super().__init__()
+        self.hub = hub
+        self.setWindowTitle("Tablet Hub — live test")
+        self.resize(540, 580)
+        tabs = QTabWidget(self)
+        tabs.addTab(self._pen_tab(), "Pen")
+        tabs.addTab(self._gesture_tab(), "Gestures")
+        QVBoxLayout(self).addWidget(tabs)
+
+        hub.pen_bridge.message.connect(self._on_pen)
+        hub.pen_bridge.status.connect(lambda s: self._conn(self.pen_status, "pen-scroll", s))
+        hub.gest_bridge.message.connect(self._on_gest)
+        hub.gest_bridge.status.connect(lambda s: self._conn(self.gest_status, "gestures", s))
+
+    # -- shared bits -----------------------------------------------------------
+    @staticmethod
+    def _indicator(text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setMinimumHeight(46)
+        lbl.setStyleSheet("border-radius:8px; background:#3a3a3a; color:#aaa;")
+        return lbl
+
+    @staticmethod
+    def _set_indicator(lbl: QLabel, on: bool) -> None:
+        if on:
+            lbl.setStyleSheet(f"border-radius:8px; background:{ACCENT}; color:#08222f; font-weight:bold;")
+        else:
+            lbl.setStyleSheet("border-radius:8px; background:#3a3a3a; color:#aaa;")
+
+    @staticmethod
+    def _conn(lbl: QLabel, name: str, ok: bool) -> None:
+        lbl.setText(f"{name}: {'receiving' if ok else 'not connected'}")
+        lbl.setStyleSheet(f"color:{'#2ecc71' if ok else '#e67e22'};")
+
+    @staticmethod
+    def _log(widget: QPlainTextEdit, text: str) -> None:
+        widget.appendPlainText(text)
+
+    # -- pen -------------------------------------------------------------------
+    def _pen_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        self.pen_status = QLabel("pen-scroll: …")
+        v.addWidget(self.pen_status)
+
+        row = QHBoxLayout()
+        self.i_tip = self._indicator("Tip")
+        self.i_b1 = self._indicator("Front")
+        self.i_b2 = self._indicator("Rear")
+        self.i_hover = self._indicator("Hover")
+        for i in (self.i_tip, self.i_b1, self.i_b2, self.i_hover):
+            row.addWidget(i)
+        v.addLayout(row)
+
+        self.pad = PenPad()
+        v.addWidget(self.pad)
+
+        self.pressure = QProgressBar()
+        self.pressure.setRange(0, 4096)
+        self.pressure.setFormat("pressure %v")
+        v.addWidget(self.pressure)
+
+        v.addWidget(QLabel("Actions seen (what each button does):"))
+        self.pen_log = QPlainTextEdit()
+        self.pen_log.setReadOnly(True)
+        self.pen_log.setMaximumBlockCount(200)
+        v.addWidget(self.pen_log)
+        return w
+
+    def _on_pen(self, d: dict) -> None:
+        t = d.get("t")
+        if t == "state":
+            self._set_indicator(self.i_tip, bool(d.get("touch")))
+            self._set_indicator(self.i_b1, bool(d.get("b1")))
+            self._set_indicator(self.i_b2, bool(d.get("b2")))
+            self._set_indicator(self.i_hover, not bool(d.get("touch")))
+            self.pressure.setValue(int(d.get("p", 0)))
+            self.pad.set_pos(int(d.get("x", 0)), int(d.get("y", 0)), 3600, 2256)
+        elif t == "action":
+            self._log(self.pen_log, d.get("label", ""))
+
+    # -- gestures --------------------------------------------------------------
+    def _gesture_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        self.gest_status = QLabel("gestures: …")
+        v.addWidget(self.gest_status)
+        self.g_fingers = QLabel("0 fingers")
+        f = QFont()
+        f.setPointSize(f.pointSize() + 10)
+        f.setBold(True)
+        self.g_fingers.setFont(f)
+        self.g_result = QLabel("No gesture yet")
+        self.g_result.setWordWrap(True)
+        self.g_result.setMinimumHeight(48)
+        self.g_result.setStyleSheet("border-radius:8px; background:#3a3a3a; color:#ccc; padding:8px;")
+        v.addWidget(self.g_fingers)
+        v.addWidget(self.g_result)
+        v.addWidget(QLabel("Detected gestures and the action they trigger:"))
+        self.gest_log = QPlainTextEdit()
+        self.gest_log.setReadOnly(True)
+        self.gest_log.setMaximumBlockCount(200)
+        v.addWidget(self.gest_log)
+        return w
+
+    def _on_gest(self, d: dict) -> None:
+        if d.get("t") == "fingers":
+            self.g_fingers.setText(f"{int(d.get('n', 0))} fingers")
+        elif d.get("t") == "gesture":
+            n = d.get("fingers")
+            g = str(d.get("gesture", "")).replace("_", " ")
+            action = d.get("action", "none")
+            label = ACTION_LABELS.get(action, action)
+            steps = int(d.get("steps", 1))
+            times = f"  \u00d7{steps}" if steps > 1 else ""
+            self.g_result.setText(f"{n}-finger {g}  \u2192  {label}{times}")
+            self._log(self.gest_log, f"{n}f {g} -> {label}{times}")
+
+
+# --------------------------------------------------------------------------- hub
+class Hub:
+    def __init__(self, app: QApplication):
+        self.app = app
+        self.cfg = load_config()
+        self.tablet: bool | None = None
+        self.bridge = Bridge()
+        self.bridge.refresh.connect(self._refresh)
+        self.bridge.info.connect(lambda t, m: QMessageBox.information(self.panel, t, m))
+        self.test_window = None
+
+        # subscribe to the daemons' event buses for the live test tabs
+        self.pen_bridge = StreamBridge()
+        self.gest_bridge = StreamBridge()
+        self.pen_client = self.gest_client = None
+        if BusClient is not None and bus_paths is not None:
+            paths = bus_paths()
+            self.pen_client = BusClient(
+                paths["pen"],
+                lambda d: self.pen_bridge.message.emit(d),
+                lambda s: self.pen_bridge.status.emit(s),
+            )
+            self.gest_client = BusClient(
+                paths["gestures"],
+                lambda d: self.gest_bridge.message.emit(d),
+                lambda s: self.gest_bridge.status.emit(s),
+            )
+
+        self.tray = QSystemTrayIcon(tray_icon(None), app)
+        self.tray.setToolTip(f"Tablet Hub {APP_VERSION}")
+        self.tray.activated.connect(self._on_tray_activated)
+        self.menu = QMenu()
+        self.tray.setContextMenu(self.menu)
+        self._build_menu()
+
+        self.panel = ControlPanel(self)
+        self._apply_effects()
+        self.tray.show()
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self._refresh)
+        self.timer.start(5000)
+        self._refresh()
+
+    # -- async -----------------------------------------------------------------
+    def _bg(self, fn) -> None:
+        def worker():
+            try:
+                fn()
+            except Exception as exc:  # noqa: BLE001
+                print(f"tablet-hub: background error: {exc}", file=sys.stderr)
+            self.bridge.refresh.emit()
+        threading.Thread(target=worker, daemon=True).start()
+
+    # -- status ----------------------------------------------------------------
+    def _refresh(self) -> None:
+        # re-read from disk so external edits and other writers are picked up,
+        # and so the settings dialog never saves a stale snapshot.
+        self.cfg = load_config()
+        self.tablet = tablet_mode()
+        text = {True: "Tablet mode: ON (folded)", False: "Tablet mode: OFF",
+                None: "Tablet mode: unknown"}[self.tablet]
+        self.status_action.setText(text)
+        self.status_action.setIcon(tray_icon(self.tablet))
+        self.tray.setIcon(tray_icon(self.tablet))
+        self.tray.setToolTip(f"Tablet Hub — {text}")
+        self.a_kb.setChecked(bool(self.cfg["keyboard_guard"].get("enabled", True)))
+        self.a_pen.setEnabled(pen_scroll_user_present())
+        self.a_gest.setChecked(bool(self.cfg["gestures"].get("enabled")))
+        self.panel.refresh()
+
+    # -- menu ------------------------------------------------------------------
+    def _build_menu(self) -> None:
+        self.menu.clear()
+        self.status_action = QAction("Tablet mode: unknown", self.menu)
+        self.status_action.setEnabled(False)
+        self.status_action.setIcon(tray_icon(None))
+        self.menu.addAction(self.status_action)
+        self.menu.addSeparator()
+
+        self.a_kb = QAction(themed("input-keyboard"), "Disable keyboard when folded", self.menu, checkable=True)
+        self.a_kb.setChecked(bool(self.cfg["keyboard_guard"].get("enabled", True)))
+        self.a_kb.triggered.connect(lambda: self.set_keyboard_guard(self.a_kb.isChecked()))
+        self.menu.addAction(self.a_kb)
+
+        self.a_pen = QAction(themed("draw-freehand"), "Pen scrolling / buttons", self.menu, checkable=True)
+        self.a_pen.setChecked(bool(self.cfg["pen_scroll"].get("enabled", True)))
+        self.a_pen.setEnabled(pen_scroll_user_present())
+        self.a_pen.triggered.connect(lambda: self.set_pen_scroll(self.a_pen.isChecked()))
+        self.menu.addAction(self.a_pen)
+
+        self.a_gest = QAction(themed("input-touchscreen"), "Multi-finger gestures", self.menu, checkable=True)
+        self.a_gest.setChecked(bool(self.cfg["gestures"].get("enabled")))
+        self.a_gest.triggered.connect(lambda: self.set_gestures(self.a_gest.isChecked()))
+        self.menu.addAction(self.a_gest)
+
+        self.a_touch = QAction(themed("input-touchscreen"), "Touch points", self.menu, checkable=True)
+        self.a_touch.setChecked(bool(self.cfg["effects"].get("touch_points")))
+        self.a_touch.triggered.connect(lambda: self.set_effect("touch_points", self.a_touch.isChecked()))
+        self.a_click = QAction(themed("tool-pointer"), "Show click", self.menu, checkable=True)
+        self.a_click.setChecked(bool(self.cfg["effects"].get("show_click")))
+        self.a_click.triggered.connect(lambda: self.set_effect("show_click", self.a_click.isChecked()))
+        effects = self.menu.addMenu(themed("preferences-desktop-tablet"), "Touch feedback")
+        effects.addAction(self.a_touch)
+        effects.addAction(self.a_click)
+
+        rot = self.menu.addMenu(themed("transform-rotate"), "Rotate screen")
+        for label, name, icon in (
+            ("Landscape", "normal", "object-flip-vertical"),
+            ("Portrait left", "left", "object-rotate-left"),
+            ("Landscape inverted", "inverted", "object-flip-horizontal"),
+            ("Portrait right", "right", "object-rotate-right"),
+            ("Cycle", "cycle", "system-reboot"),
+        ):
+            act = QAction(themed(icon), label, rot)
+            act.triggered.connect(lambda _=False, n=name: self.rotate(n))
+            rot.addAction(act)
+
+        self.menu.addSeparator()
+        a_panel = QAction(themed("input-tablet"), "Open tablet panel", self.menu)
+        a_panel.triggered.connect(self.open_panel)
+        self.menu.addAction(a_panel)
+        a_test = QAction(themed("system-run"), "Live pen / gesture test…", self.menu)
+        a_test.triggered.connect(self.open_test)
+        self.menu.addAction(a_test)
+        if not pen_scroll_user_present():
+            a_mig = QAction(themed("dialog-password"), "Set up pen scrolling (user service)…", self.menu)
+            a_mig.triggered.connect(self.migrate)
+            self.menu.addAction(a_mig)
+        a_settings = QAction(themed("configure"), "Settings…", self.menu)
+        a_settings.triggered.connect(self.open_settings)
+        self.menu.addAction(a_settings)
+        a_reload = QAction(themed("view-refresh"), "Reload", self.menu)
+        a_reload.triggered.connect(self.reload)
+        self.menu.addAction(a_reload)
+        a_repair = QAction(themed("tools-wizard"), "Repair services…", self.menu)
+        a_repair.triggered.connect(self.repair)
+        self.menu.addAction(a_repair)
+        self.menu.addSeparator()
+        a_about = QAction(f"tablet-hub {APP_VERSION}", self.menu)
+        a_about.setEnabled(False)
+        self.menu.addAction(a_about)
+        a_quit = QAction(themed("application-exit"), "Quit", self.menu)
+        a_quit.triggered.connect(self.app.quit)
+        self.menu.addAction(a_quit)
+
+    # -- interaction -----------------------------------------------------------
+    def _on_tray_activated(self, reason) -> None:
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                      QSystemTrayIcon.ActivationReason.MiddleClick):
+            self.open_panel()
+
+    def open_panel(self) -> None:
+        self.panel.refresh()
+        self.panel.show()
+        self.panel.raise_()
+        self.panel.activateWindow()
+
+    def open_test(self) -> None:
+        if self.test_window is None:
+            self.test_window = TestWindow(self)
+        self.test_window.show()
+        self.test_window.raise_()
+        self.test_window.activateWindow()
+
+    # -- actions ---------------------------------------------------------------
+    def set_keyboard_guard(self, on: bool) -> None:
+        self.cfg["keyboard_guard"]["enabled"] = on
+        save_config(self.cfg)
+        self._bg(lambda: userctl("restart", "tablet-keyboard-guard.service"))
+
+    def set_pen_scroll(self, on: bool) -> None:
+        self.cfg["pen_scroll"]["enabled"] = on
+        save_config(self.cfg)
+        self._bg(lambda: self._svc("pen-scroll", on))
+
+    def set_gestures(self, on: bool) -> None:
+        self.cfg["gestures"]["enabled"] = on
+        save_config(self.cfg)
+        self._bg(lambda: self._svc("tabhub-gestures", on))
+
+    def _svc(self, unit: str, on: bool) -> None:
+        if on:
+            userctl("enable", "--now", f"{unit}.service")
+            userctl("restart", f"{unit}.service")
+        else:
+            userctl("stop", f"{unit}.service")
+            userctl("disable", f"{unit}.service")
+
+    def set_effect(self, key: str, on: bool) -> None:
+        self.cfg["effects"][key] = on
+        save_config(self.cfg)
+        self._bg(self._apply_effects)
+
+    def _apply_effects(self) -> None:
+        e = self.cfg["effects"]
+        kwinrc_set("Plugins", "touchpointsEnabled", "true" if e.get("touch_points") else "false")
+        kwinrc_set("Plugins", "mouseclickEnabled", "true" if e.get("show_click") else "false")
+        reconfigure_kwin()
+        if e.get("show_click"):
+            kwin_effects("loadEffect", "mouseclick")
+        else:
+            kwin_effects("unloadEffect", "mouseclick")
+
+    def rotate(self, name: str) -> None:
+        if name == "cycle":
+            run([ROTATE, "cycle"])
+        else:
+            run([ROTATE, "set", name])
+
+    def migrate(self) -> None:
+        def work():
+            ok, msg = migrate_pen_scroll()
+            self.bridge.info.emit("Pen scrolling", msg)
+        self._bg(work)
+
+    def open_settings(self) -> None:
+        dlg = SettingsDialog(self.cfg, self.panel)
+        if dlg.exec():
+            self.cfg = dlg.result_config()
+            save_config(self.cfg)
+
+            def apply():
+                userctl("restart", "tablet-keyboard-guard.service")
+                if pen_scroll_user_present():
+                    if self.cfg["pen_scroll"].get("enabled", True):
+                        userctl("restart", "pen-scroll.service")
+                    else:
+                        userctl("stop", "pen-scroll.service")
+                if self.cfg["gestures"].get("enabled"):
+                    userctl("restart", "tabhub-gestures.service")
+                else:
+                    userctl("stop", "tabhub-gestures.service")
+                self._apply_effects()
+
+            self._bg(apply)
+            QTimer.singleShot(400, self._after_settings)
+
+    def _after_settings(self) -> None:
+        self.cfg = load_config()
+        self._build_menu()
+        self._refresh()
+
+    def reload(self) -> None:
+        self.cfg = load_config()
+        self._build_menu()
+        self._refresh()
+
+    def repair(self) -> None:
+        """Re-run the installer to restore missing units/files."""
+        script = os.path.join(HOME, "tablet-hub/install.sh")
+        if not os.path.exists(script):
+            self.bridge.info.emit("Repair", f"installer not found at {script}")
+            return
+        self._bg(lambda: run(["bash", script]))
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    app.setApplicationName("tablet-hub")
+    app.setQuitOnLastWindowClosed(False)
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        print("tablet-hub: no system tray available", file=sys.stderr)
+        return 1
+    Hub(app)
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
